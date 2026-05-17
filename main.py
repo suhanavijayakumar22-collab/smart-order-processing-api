@@ -39,7 +39,6 @@ class ReturnInspection(BaseModel):
 app = FastAPI(title="Smart Order Processing API")
 
 # 2. Set up the Database Connection
-# Replace "YOUR_PASSWORD" with the password you use for MySQL root!
 def get_db_connection():
     try:
         conn = mysql.connector.connect(
@@ -70,7 +69,7 @@ def check_db():
 
 @app.post("/place-order")
 def place_order(order: CreateOrderRequest):
-    # 1. Bouncer Check (From your code!)
+    # 1. Bouncer Check
     if order.delivery_type not in ["normal", "fast"]:
         raise HTTPException(status_code=400, detail="Delivery type must be 'normal' or 'fast'")
 
@@ -83,7 +82,10 @@ def place_order(order: CreateOrderRequest):
     try:
         conn.start_transaction()
 
-        # 2. Check Product Availability Constraint
+        # 2. Check Product Availability Constraint (Updated for Delay Requirement)
+        is_delayed = False
+        delay_reason = ""
+        
         for item in order.items:
             cursor.execute("SELECT stock_count, name FROM Products WHERE product_id = %s", (item.product_id,))
             product = cursor.fetchone()
@@ -91,7 +93,31 @@ def place_order(order: CreateOrderRequest):
             if not product:
                 raise ValueError(f"Product {item.product_id} not found.")
             if product["stock_count"] < item.quantity:
-                raise ValueError(f"Not enough stock for {product['name']}. Only {product['stock_count']} left!")
+                is_delayed = True
+                delay_reason = f"Not enough stock for {product['name']}."
+                break # We know it must be delayed, stop checking
+
+        new_order_id = "ORD-" + str(uuid.uuid4())[:8]
+
+        # 3. BRANCH A: The order is delayed!
+        if is_delayed:
+            cursor.execute("""
+                INSERT INTO Orders (order_id, customer_id, delivery_type, status, order_time) 
+                VALUES (%s, %s, %s, 'delayed', %s)
+            """, (new_order_id, order.customer_id, order.delivery_type, datetime.now()))
+            
+            for item in order.items:
+                cursor.execute(
+                    "INSERT INTO Order_Items (order_id, product_id, quantity) VALUES (%s, %s, %s)",
+                    (new_order_id, item.product_id, item.quantity)
+                )
+            
+            conn.commit()
+            return {
+                "message": f"Order delayed. {delay_reason} It will be processed when stock arrives.",
+                "order_id": new_order_id,
+                "status": "delayed"
+            }
 
         # 3. ASSIGN A STORAGE AREA (Single-Location Preference)
         product_ids = [item.product_id for item in order.items]
@@ -115,12 +141,41 @@ def place_order(order: CreateOrderRequest):
                 raise ValueError("System Overloaded: No storage areas have capacity right now.")
             assigned_storage_id = backup_area["storage_id"]
 
-        # 4. CREATE THE ORDER (*** THIS IS THE STEP YOUR CODE WAS MISSING! ***)
+        # 4. CREATE THE ORDER
         new_order_id = "ORD-" + str(uuid.uuid4())[:8]
         cursor.execute("""
             INSERT INTO Orders (order_id, customer_id, delivery_type, status, assigned_storage_id, order_time) 
             VALUES (%s, %s, %s, 'placed', %s, %s)
         """, (new_order_id, order.customer_id, order.delivery_type, assigned_storage_id, datetime.now()))
+
+
+        # 4.5 CHECK STAFF PACKING CAPACITY CONSTRAINT
+        # We calculate total capacity dynamically: (staff_available * max_orders_per_hour)
+        cursor.execute("""
+            SELECT counter_id, staff_available, max_orders_per_hour, current_load 
+            FROM Packing_Counters 
+            WHERE current_load < (staff_available * max_orders_per_hour) 
+            AND working_status = 'active'
+            ORDER BY current_load ASC 
+            LIMIT 1
+        """)
+        assigned_counter = cursor.fetchone()
+
+        # If all staff are completely maxed out, we must delay the order!
+        if not assigned_counter:
+            conn.rollback()
+            return {
+                "message": "Order delayed. All packing staff are currently at maximum capacity.",
+                "order_id": new_order_id,
+                "status": "delayed"
+            }
+
+        # If a counter has human capacity, increase its workload by 1
+        counter_id = assigned_counter["counter_id"]
+        cursor.execute(
+            "UPDATE Packing_Counters SET current_load = current_load + 1 WHERE counter_id = %s",
+            (counter_id,)
+        )
 
         # 5. DEDUCT THE STOCK (FIFO) AND SAVE ITEMS
         for item in order.items:
@@ -340,9 +395,11 @@ def request_return(request: ReturnRequest):
             INSERT INTO Returns (order_id, product_id, reason, request_date, inspection_status)
             VALUES (%s, %s, %s, %s, 'pending')
         """, (request.order_id, request.product_id, request.reason, datetime.now())) # <-- request.reason added here!
+        new_return_id = cursor.lastrowid
 
         conn.commit()
-        return {"message": "Return request submitted successfully. Awaiting warehouse inspection."}
+        return {"message": "Return request submitted successfully. Awaiting warehouse inspection.",
+        "return_id": new_return_id}
 
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
@@ -461,6 +518,131 @@ def get_system_status():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch status: {str(e)}")
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/process-delayed-orders")
+def process_delayed_orders():
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database is down!")
+    
+    cursor = conn.cursor(dictionary=True)
+    processed_count = 0
+
+    try:
+        # OPEN THE DOOR ONCE AT THE VERY BEGINNING
+        conn.start_transaction() 
+
+        # 1. Find all delayed orders, sorting by oldest first
+        cursor.execute("SELECT * FROM Orders WHERE status = 'delayed' ORDER BY order_time ASC")
+        delayed_orders = cursor.fetchall()
+
+        for order in delayed_orders:
+            order_id = order['order_id']
+            
+            # Fetch the items the customer was waiting for
+            cursor.execute("SELECT product_id, quantity FROM Order_Items WHERE order_id = %s", (order_id,))
+            items = cursor.fetchall()
+            
+            # 2. Check if we finally have enough stock
+            can_fulfill = True
+            for item in items:
+                cursor.execute("SELECT stock_count FROM Products WHERE product_id = %s", (item['product_id'],))
+                prod = cursor.fetchone()
+                if not prod or prod['stock_count'] < item['quantity']:
+                    can_fulfill = False
+                    break 
+            
+            # 3. If we have the stock, fulfill it!
+            if can_fulfill:
+                # Deduct stock (FIFO)
+                for item in items:
+                    cursor.execute("""
+                        UPDATE Products SET stock_count = stock_count - %s 
+                        WHERE product_id = %s ORDER BY stored_date ASC LIMIT 1
+                    """, (item['quantity'], item['product_id']))
+                
+                # Find an empty storage area
+                cursor.execute("SELECT storage_id FROM Storage_Areas WHERE current_load < max_capacity AND working_status = 'active' LIMIT 1")
+                area = cursor.fetchone()
+                if not area:
+                    raise ValueError("No storage space available to process delayed orders.")
+                
+                # Take up warehouse space
+                cursor.execute("UPDATE Storage_Areas SET current_load = current_load + 1 WHERE storage_id = %s", (area['storage_id'],))
+                
+                # Change status from 'delayed' to 'placed' and assign storage
+                cursor.execute("UPDATE Orders SET status = 'placed', assigned_storage_id = %s WHERE order_id = %s", (area['storage_id'], order_id))
+                
+                # Give the customer their reward points!
+                cursor.execute("UPDATE Customers SET reward_points = reward_points + 10 WHERE customer_id = %s", (order['customer_id'],))
+                
+                processed_count += 1
+
+        # SAVE EVERYTHING AT ONCE AT THE VERY END
+        conn.commit()
+        
+        return {"message": f"Swept the waitlist! Successfully fulfilled {processed_count} delayed orders."}
+
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/batch-packing-schedule")
+def get_batch_packing_schedule():
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database is down!")
+    
+    cursor = conn.cursor(dictionary=True)
+
+    try:
+        # The Magic Query: We join Orders, Items, and Products, 
+        # and strictly group them by Delivery Type and Category!
+        cursor.execute("""
+            SELECT 
+                o.delivery_type, 
+                p.category, 
+                o.order_id, 
+                p.name as product_name, 
+                oi.quantity
+            FROM Orders o
+            JOIN Order_Items oi ON o.order_id = oi.order_id
+            JOIN Products p ON oi.product_id = p.product_id
+            WHERE o.status = 'placed'
+            ORDER BY o.delivery_type DESC, p.category ASC
+        """)
+        raw_queue = cursor.fetchall()
+
+        # Organize the raw SQL data into neat "Batches" for the workers
+        batches = {}
+        for row in raw_queue:
+            # Create a unique batch name, e.g., "fast-Electronics"
+            batch_key = f"{row['delivery_type']}-{row['category']}"
+            
+            if batch_key not in batches:
+                batches[batch_key] = []
+                
+            batches[batch_key].append({
+                "order_id": row["order_id"],
+                "product": row["product_name"],
+                "quantity": row["quantity"]
+            })
+
+        return {
+            "message": "Batch schedule generated successfully.",
+            "total_pending_items": len(raw_queue),
+            "packing_batches": batches
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         cursor.close()
         conn.close()
